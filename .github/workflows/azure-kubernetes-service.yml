@@ -1,0 +1,190 @@
+name: Build and deploy to k8s AKS
+on:
+  push:
+    branches:
+      - main
+      # - staging
+
+env:
+  CLUSTER_NAME: k8s-cluster
+  RESOURCE_GROUP: rg-k8s
+  WEB_IMAGE: ghcr.io/mkanus-inc/k8s/web
+  RESULT_IMAGE: ghcr.io/mkanus-inc/k8s/result
+  WEB_SERVER_MANIFEST_PATH: "${{ github.workspace }}/web_image"
+  RESULT_SERVER_MANIFEST_PATH: "${{ github.workspace }}/result_image"
+  LOCATION: eastus
+  NODE_SIZE: Standard_D8ds_v5
+ 
+jobs:
+  creating-cluster:
+    if: "contains(github.event.head_commit.message, 'creating-cluster')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in with service principle to Azure
+        run: |
+          az login --service-principal --username ${{ secrets.AZURE_APP_ID }} --password ${{ secrets.AZURE_PASSWORD_ID }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: creating resource group
+        run: |
+          az group create --name ${{ env.RESOURCE_GROUP }} --location ${{ env.LOCATION }}
+
+      - name: creating azure aks
+        run: |
+          az group create --name ${{ env.RESOURCE_GROUP }} --location ${{ env.LOCATION }}
+          az aks create --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --location ${{ env.LOCATION }} --kubernetes-version 1.28.3 --tier standard --enable-cluster-autoscaler --node-count 2 --min-count 2 --max-count 5 --max-pods 110 --node-vm-size ${{ env.NODE_SIZE }} --network-plugin azure --network-policy azure --load-balancer-sku standard --enable-addons monitoring --generate-ssh-keys
+
+      - name: connect to AKS cluster
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: creating imagePullSecrets
+        run: |
+          kubectl create secret docker-registry ghcr --docker-server=https://ghcr.io --docker-username=zzzzzzzzzzzzzzzzzzzzz --docker-password=ghp_zzzzzzzzzzzzzzzzzzzzzzz --docker-email=zzzzzzzzzzzzzz
+
+  web-build:
+    if: "contains(github.event.head_commit.message, 'creating-cluster') || contains(github.event.head_commit.message, 'run-manager') || contains(github.event.head_commit.message, 'run-all')"
+    needs: creating-cluster
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - run: |
+          cd ${{ github.workspace }}/web_image
+
+      - name: tagging image and metadata
+        uses: docker/metadata-action@v3
+        id: metadata
+        with:
+          images: ${{ env.WEB_IMAGE }}
+          tags: |
+            ${{ github.sha }}
+            latest
+
+      - name: login GHCR
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push image to repository
+        uses: int128/kaniko-action@v1
+        with:
+          context: ${{ github.workspace }}/web_image
+          dockerfile: Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+  result-build:
+    if: "contains(github.event.head_commit.message, 'creating-cluster') || contains(github.event.head_commit.message, 'run-manager') || contains(github.event.head_commit.message, 'run-all')"
+    needs: creating-cluster
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - run: |
+          cd ${{ github.workspace }}/result_image
+
+      - name: tagging image and metadata
+        uses: docker/metadata-action@v3
+        id: metadata
+        with:
+          images: ${{ env.RESULT_IMAGE }}
+          tags: |
+            ${{ github.sha }}
+            latest
+
+      - name: login GHCR
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push image to repository
+        uses: int128/kaniko-action@v1
+        with:
+          context: ${{ github.workspace }}/result_image
+          dockerfile: Dockerfile
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+
+  mysql-deploy:
+    if: "contains(github.event.head_commit.message, 'creating-cluster') || contains(github.event.head_commit.message, 'run-proxy') || contains(github.event.head_commit.message, 'run-all')"
+    needs: creating-cluster
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in with service principle to Azure
+        run: |
+          az login --service-principal --username ${{ secrets.AZURE_APP_ID }} --password ${{ secrets.AZURE_PASSWORD_ID }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: connect to AKS cluster
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: deploy proxy manifest yaml files
+        run: |
+          cd ${{ github.workspace }}/mysql_deployment
+          kubectl apply -f .
+          
+  web-deploy:
+    if: "contains(github.event.head_commit.message, 'creating-cluster') || contains(github.event.head_commit.message, 'run-manager') || contains(github.event.head_commit.message, 'run-all')"
+    needs: web-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in with service principle to Azure
+        run: |
+          az login --service-principal --username ${{ secrets.AZURE_APP_ID }} --password ${{ secrets.AZURE_PASSWORD_ID }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: connect to AKS cluster
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: deploy web manifest yaml files
+        run: |
+          cd ${{ github.workspace }}/web_server
+          kustomize edit set image ${WEB_IMAGE}=:${{ github.sha }}
+          kubectl apply -k .
+
+  result_deploy:
+    if: "contains(github.event.head_commit.message, 'creating-cluster') || contains(github.event.head_commit.message, 'run-proxy') || contains(github.event.head_commit.message, 'run-all')"
+    needs: result-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in with service principle to Azure
+        run: |
+          az login --service-principal --username ${{ secrets.AZURE_APP_ID }} --password ${{ secrets.AZURE_PASSWORD_ID }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: connect to AKS cluster
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }}
+
+      - name: deploy proxy manifest yaml files
+        run: |
+          cd ${{ github.workspace }}/result_server
+          kustomize edit set image ${RESULT_IMAGE}=:${{ github.sha }}
+          kubectl apply -k .
